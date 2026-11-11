@@ -4,7 +4,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'api.dart';
+import 'backend.dart';
 import 'draw.dart';
 import 'merge.dart';
 import 'models.dart';
@@ -365,7 +365,7 @@ class Fut extends ChangeNotifier {
 /// Estado da conexão com o grupo, para mostrar na tela.
 enum SyncStatus { local, synced, syncing, offline }
 
-/// Dados de sincronia de um fut: a versão do servidor que este aparelho
+/// Dados de sincronia de um fut: a versão do grupo que este aparelho
 /// conhece e como o fut estava nela (base para juntar mudanças).
 class _SyncInfo {
   _SyncInfo({this.versao = 0, this.base, this.dirty = false});
@@ -387,32 +387,41 @@ class _SyncInfo {
 }
 
 /// Todos os futs. Sem grupo, ficam só no aparelho. Com grupo, cada mudança
-/// vai para a API e as mudanças dos outros chegam a cada poucos segundos.
+/// vai para o grupo e as mudanças dos outros chegam na hora.
 class FutStore extends ChangeNotifier {
-  FutStore(this._prefs, {Api? api}) : _api = api ?? Api() {
+  FutStore(this._prefs, {this._backend}) {
     _load();
   }
 
   static const _key = 'society_futs_v1';
   static const _legacyKey = 'society_v1';
-  static const _syncKey = 'society_sync_v1';
-  static const pollEvery = Duration(seconds: 5);
+  static const _syncKey = 'society_sync_v2';
+  static const retryEvery = Duration(seconds: 10);
 
   final SharedPreferences _prefs;
-  final Api _api;
+  final Backend? _backend;
   final List<Fut> _futs = [];
 
   String? groupCode;
   String? groupName;
   final Map<String, _SyncInfo> _sync = {};
   final Set<String> _pendingDeletes = {};
+
+  /// Futs que já apareceram no grupo. Só esses podem ter sido apagados lá:
+  /// um fut que ainda não apareceu pode só não ter chegado.
+  final Set<String> _seen = {};
   SyncStatus status = SyncStatus.local;
 
-  Timer? _timer;
+  StreamSubscription<List<ServerFut>>? _sub;
+  List<ServerFut>? _fromServer;
+  bool _heard = false;
+  Timer? _retry;
   Timer? _pushDebounce;
   Future<void>? _running;
   bool _again = false;
 
+  /// Dá para compartilhar (no Android ainda não tem grupo).
+  bool get canShare => _backend != null;
   bool get inGroup => groupCode != null;
 
   /// Mais recente primeiro.
@@ -510,7 +519,7 @@ class FutStore extends ChangeNotifier {
       }
 
       final sync = _prefs.getString(_syncKey);
-      if (sync != null) {
+      if (sync != null && canShare) {
         final s = jsonDecode(sync) as Map<String, dynamic>;
         groupCode = s['grupo'] as String?;
         groupName = s['nome'] as String?;
@@ -526,7 +535,11 @@ class FutStore extends ChangeNotifier {
     } catch (e) {
       debugPrint('Falha ao ler dados salvos: $e');
     }
-    if (inGroup) _startPolling();
+    // O que já tinha versão no grupo já foi visto lá.
+    _seen.addAll(
+      _sync.entries.where((e) => e.value.versao > 0).map((e) => e.key),
+    );
+    if (inGroup) _connect();
   }
 
   // ---------- Grupo ----------
@@ -540,41 +553,41 @@ class FutStore extends ChangeNotifier {
 
   /// Cria um grupo e manda para ele os futs deste aparelho.
   Future<void> createGroup(String nome) async {
-    final g = await _api.criarGrupo(nome);
+    final g = await _backend!.criarGrupo(nome);
     _enterGroup(g.codigo, g.nome);
   }
 
   /// Entra no grupo do link. Os futs deste aparelho vão junto.
   Future<void> joinGroup(String codigo) async {
-    final nome = await _api.nomeDoGrupo(codigo);
+    final nome = await _backend!.nomeDoGrupo(codigo);
     _enterGroup(codigo, nome);
   }
 
   /// Confere o código do link sem entrar: devolve o nome do grupo.
-  Future<String> groupNameFor(String codigo) => _api.nomeDoGrupo(codigo);
+  Future<String> groupNameFor(String codigo) => _backend!.nomeDoGrupo(codigo);
 
   void _enterGroup(String codigo, String nome) {
     groupCode = codigo;
     groupName = nome;
     _sync.clear();
     _pendingDeletes.clear();
+    _seen.clear();
     for (final f in _futs) {
       _sync[f.id] = _SyncInfo(dirty: true);
     }
-    _api.forget();
     _changed();
-    _startPolling();
+    _connect();
   }
 
   /// Para de sincronizar. Os futs continuam neste aparelho, a não ser que
   /// [keepFuts] seja falso (trocando de um grupo para outro).
   void leaveGroup({bool keepFuts = true}) {
-    _timer?.cancel();
-    _pushDebounce?.cancel();
+    _disconnect();
     groupCode = null;
     groupName = null;
     _sync.clear();
     _pendingDeletes.clear();
+    _seen.clear();
     if (!keepFuts) {
       for (final f in _futs) {
         f.onSave = null;
@@ -582,28 +595,56 @@ class FutStore extends ChangeNotifier {
       _futs.clear();
     }
     status = SyncStatus.local;
-    _api.forget();
     _changed();
   }
 
   // ---------- Sincronia ----------
 
-  void _startPolling() {
-    _timer?.cancel();
-    _timer = Timer.periodic(pollEvery, (_) => syncNow());
+  void _connect() {
+    _disconnect();
+    final code = groupCode!;
+    _heard = false;
+    _setStatus(SyncStatus.syncing);
+    _sub = _backend!
+        .futs(code)
+        .listen(
+          (list) {
+            _heard = true;
+            _fromServer = list;
+            syncNow();
+          },
+          onError: (Object e) {
+            debugPrint('Sem conexão com o grupo: $e');
+            _setStatus(SyncStatus.offline);
+          },
+        );
+    // Tenta de novo o que ficou pendente (sem internet, por exemplo).
+    _retry = Timer.periodic(retryEvery, (_) {
+      if (_pendingDeletes.isNotEmpty || _sync.values.any((s) => s.dirty)) {
+        syncNow();
+      }
+    });
     syncNow();
   }
 
-  /// Pausa a busca enquanto o app está em segundo plano.
-  void pause() => _timer?.cancel();
-
-  void resume() {
-    if (inGroup) _startPolling();
+  void _disconnect() {
+    _sub?.cancel();
+    _sub = null;
+    _retry?.cancel();
+    _pushDebounce?.cancel();
+    _fromServer = null;
   }
+
+  /// O app voltou para a tela: tenta mandar o que ficou pendente.
+  void resume() {
+    if (inGroup) syncNow();
+  }
+
+  void pause() {}
 
   void _schedulePush() {
     _pushDebounce?.cancel();
-    _pushDebounce = Timer(const Duration(milliseconds: 500), syncNow);
+    _pushDebounce = Timer(const Duration(milliseconds: 400), syncNow);
   }
 
   void _setStatus(SyncStatus s) {
@@ -612,7 +653,7 @@ class FutStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Manda o que mudou aqui e traz o que mudou nos outros aparelhos.
+  /// Junta o que chegou do grupo e manda o que mudou aqui.
   ///
   /// Se já tem uma rodada em andamento, marca para repetir e espera as duas.
   Future<void> syncNow() {
@@ -636,18 +677,23 @@ class FutStore extends ChangeNotifier {
     final code = groupCode;
     if (code == null) return;
     try {
+      final incoming = _fromServer;
+      _fromServer = null;
+      if (incoming != null) _applyServer(incoming);
+
       final hasLocal =
           _pendingDeletes.isNotEmpty || _sync.values.any((s) => s.dirty);
-      if (hasLocal) _setStatus(SyncStatus.syncing);
-      await _pushDeletes(code);
-      await _pull(code);
-      await _pushDirty(code);
-      _setStatus(SyncStatus.synced);
-    } on ApiException catch (e) {
-      debugPrint('API: $e');
-      _setStatus(SyncStatus.offline);
+      if (hasLocal) {
+        _setStatus(SyncStatus.syncing);
+        await _pushDeletes(code);
+        await _pushDirty(code);
+      }
+      // Só fica "sincronizado" depois que o grupo respondeu pelo menos uma vez.
+      if (_heard) _setStatus(SyncStatus.synced);
+    } on GoneException {
+      // Tratado por fut em _pushDirty.
     } catch (e) {
-      debugPrint('Sem conexão com a API: $e');
+      debugPrint('Falha ao sincronizar: $e');
       _setStatus(SyncStatus.offline);
     } finally {
       _saveLocal();
@@ -656,19 +702,18 @@ class FutStore extends ChangeNotifier {
 
   Future<void> _pushDeletes(String code) async {
     for (final id in [..._pendingDeletes]) {
-      await _api.apagar(code, id);
+      await _backend!.apagar(code, id);
       _pendingDeletes.remove(id);
     }
   }
 
-  Future<void> _pull(String code) async {
-    final list = await _api.listar(code);
-    if (list == null) return;
+  void _applyServer(List<ServerFut> list) {
     var changed = false;
     final onServer = <String>{};
 
     for (final s in list) {
       onServer.add(s.id);
+      _seen.add(s.id);
       if (_pendingDeletes.contains(s.id)) continue;
       final local = byId(s.id);
       final info = _sync[s.id];
@@ -678,26 +723,26 @@ class FutStore extends ChangeNotifier {
         _futs.add(f);
         _sync[s.id] = _SyncInfo(versao: s.versao, base: s.dados);
         changed = true;
-      } else if (info == null || info.versao != s.versao) {
+      } else if (info == null || s.versao > info.versao) {
         _receive(local, info ?? (_sync[s.id] = _SyncInfo()), s);
         changed = true;
       }
     }
 
-    // Apagados em outro aparelho: estavam no servidor e sumiram.
+    // Apagados em outro aparelho: estavam no grupo e sumiram.
     for (final f in [..._futs]) {
-      final info = _sync[f.id];
-      if (info != null && info.versao > 0 && !onServer.contains(f.id)) {
+      if (_seen.contains(f.id) && !onServer.contains(f.id)) {
         _futs.remove(f);
         f.onSave = null;
         _sync.remove(f.id);
+        _seen.remove(f.id);
         changed = true;
       }
     }
     if (changed) notifyListeners();
   }
 
-  /// Chegou uma versão nova do servidor. Sem mudança pendente aqui, ela
+  /// Chegou uma versão nova do grupo. Sem mudança pendente aqui, ela
   /// substitui a local; com mudança pendente, as duas são juntadas.
   void _receive(Fut local, _SyncInfo info, ServerFut s) {
     if (info.dirty) {
@@ -719,12 +764,12 @@ class FutStore extends ChangeNotifier {
       for (var attempt = 0; attempt < 3; attempt++) {
         final sent = f.toJson();
         try {
-          final versao = await _api.gravar(code, f.id, info.versao, sent);
+          final versao = await _backend!.gravar(code, f.id, info.versao, sent);
           info
             ..versao = versao
             ..base = sent
             // Mudou de novo enquanto gravava? Continua pendente.
-            ..dirty = jsonEncode(f.toJson()) != jsonEncode(sent);
+            ..dirty = !sameJson(f.toJson(), sent);
           break;
         } on ConflictException catch (c) {
           _receive(f, info, c.atual);
@@ -743,8 +788,7 @@ class FutStore extends ChangeNotifier {
 
   @override
   void dispose() {
-    _timer?.cancel();
-    _pushDebounce?.cancel();
+    _disconnect();
     super.dispose();
   }
 }

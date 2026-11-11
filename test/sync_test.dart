@@ -1,87 +1,106 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:society/api.dart';
+import 'package:society/backend.dart';
 import 'package:society/merge.dart';
 import 'package:society/state.dart';
 
-/// API falsa em memória, com as mesmas regras da society-api.
-class FakeServer {
+/// Grupo falso em memória, com as mesmas regras do Firestore do app. As
+/// mudanças só chegam aos aparelhos quando o teste chama [deliver], para dar
+/// para simular duas pessoas mexendo antes de ver a mudança da outra.
+class FakeBackend implements Backend {
   final grupos = <String, String>{};
-  final futs =
+  final futsDb =
       <String, Map<String, ({int versao, Map<String, dynamic> dados})>>{};
+  final _listeners = <String, List<StreamController<List<ServerFut>>>>{};
   var _seq = 0;
 
-  http.Client client() => MockClient((req) async {
-    final grupo = req.headers['X-Grupo'] ?? req.headers['x-grupo'];
-    final path = req.url.path;
-    Map<String, dynamic> body() =>
-        req.body.isEmpty ? {} : jsonDecode(req.body) as Map<String, dynamic>;
-    http.Response json(int status, Object? o) => http.Response(
-      jsonEncode(o),
-      status,
-      headers: {'content-type': 'application/json'},
-    );
+  /// Cópia "de ida e volta", como o Firestore: reordena as chaves.
+  Map<String, dynamic> _roundTrip(Map<String, dynamic> d) {
+    final copy = jsonDecode(jsonEncode(d)) as Map<String, dynamic>;
+    return {for (final k in copy.keys.toList().reversed) k: copy[k]};
+  }
 
-    if (req.method == 'POST' && path == '/api/grupos') {
-      final codigo = 'codigo${_seq++}';
-      grupos[codigo] = body()['nome'] as String;
-      futs[codigo] = {};
-      return json(201, {'codigo': codigo, 'nome': grupos[codigo]});
-    }
-    if (grupo == null || !grupos.containsKey(grupo)) {
-      return json(404, {'erro': 'Grupo não encontrado.'});
-    }
-    final doGrupo = futs[grupo]!;
-    if (path == '/api/grupos/atual') {
-      return json(200, {'codigo': grupo, 'nome': grupos[grupo]});
-    }
-    if (req.method == 'GET' && path == '/api/futs') {
-      return json(200, [
-        for (final e in doGrupo.entries)
-          {'id': e.key, 'versao': e.value.versao, 'dados': e.value.dados},
-      ]);
-    }
-    final id = Uri.decodeComponent(path.split('/').last);
-    if (req.method == 'DELETE') {
-      doGrupo.remove(id);
-      return http.Response('', 204);
-    }
-    if (req.method == 'PUT') {
-      final b = body();
-      final versao = b['versao'] as int;
-      final atual = doGrupo[id];
-      if ((atual == null && versao == 0) ||
-          (atual != null && atual.versao == versao)) {
-        // Embaralha a ordem das chaves, como o jsonb do Postgres.
-        final dados = (b['dados'] as Map<String, dynamic>);
-        final reordered = {
-          for (final k in dados.keys.toList().reversed) k: dados[k],
-        };
-        doGrupo[id] = (versao: versao + 1, dados: reordered);
-        return json(200, {'id': id, 'versao': versao + 1});
+  List<ServerFut> _list(String codigo) => [
+    for (final e in futsDb[codigo]!.entries)
+      ServerFut(e.key, e.value.versao, _roundTrip(e.value.dados)),
+  ];
+
+  /// Entrega o estado atual do grupo para quem está ouvindo.
+  Future<void> deliver() async {
+    for (final e in _listeners.entries) {
+      for (final c in e.value) {
+        c.add(_list(e.key));
       }
-      if (atual == null) return json(404, {'erro': 'apagado'});
-      return json(409, {
-        'erro': 'conflito',
-        'atual': {'id': id, 'versao': atual.versao, 'dados': atual.dados},
-      });
     }
-    return json(400, {'erro': '?'});
-  });
+    await pumpEventQueue();
+  }
+
+  @override
+  Future<({String codigo, String nome})> criarGrupo(String nome) async {
+    final codigo = 'codigo${_seq++}';
+    grupos[codigo] = nome;
+    futsDb[codigo] = {};
+    return (codigo: codigo, nome: nome);
+  }
+
+  @override
+  Future<String> nomeDoGrupo(String codigo) async =>
+      grupos[codigo] ?? (throw GroupNotFoundException());
+
+  @override
+  Stream<List<ServerFut>> futs(String codigo) {
+    late final StreamController<List<ServerFut>> c;
+    c = StreamController<List<ServerFut>>(
+      onListen: () => c.add(_list(codigo)),
+      onCancel: () => _listeners[codigo]?.remove(c),
+    );
+    (_listeners[codigo] ??= []).add(c);
+    return c.stream;
+  }
+
+  @override
+  Future<int> gravar(
+    String codigo,
+    String id,
+    int versao,
+    Map<String, dynamic> dados,
+  ) async {
+    final doGrupo = futsDb[codigo]!;
+    final atual = doGrupo[id];
+    if (atual == null) {
+      if (versao != 0) throw GoneException();
+      doGrupo[id] = (versao: 1, dados: _roundTrip(dados));
+      return 1;
+    }
+    if (atual.versao != versao) {
+      throw ConflictException(
+        ServerFut(id, atual.versao, _roundTrip(atual.dados)),
+      );
+    }
+    doGrupo[id] = (versao: versao + 1, dados: _roundTrip(dados));
+    return versao + 1;
+  }
+
+  @override
+  Future<void> apagar(String codigo, String id) async =>
+      futsDb[codigo]!.remove(id);
 }
 
-Future<FutStore> device(FakeServer server) async {
+Future<FutStore> device(FakeBackend backend) async {
   SharedPreferences.resetStatic();
   SharedPreferences.setMockInitialValues({});
   final prefs = await SharedPreferences.getInstance();
-  return FutStore(
-    prefs,
-    api: Api(baseUrl: 'http://api', client: server.client()),
-  );
+  return FutStore(prefs, backend: backend);
+}
+
+Future<void> settle(List<FutStore> devices) async {
+  await pumpEventQueue();
+  for (final d in devices) {
+    await d.syncNow();
+  }
 }
 
 void main() {
@@ -116,29 +135,39 @@ void main() {
     expect(players, {'a': true, 'b': true, 'c': false});
   });
 
+  test('o código do grupo é longo e serve para link', () {
+    final codigo = newGroupCode();
+    expect(codigo, hasLength(24));
+    expect(RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(codigo), isTrue);
+  });
+
   test('o que um aparelho muda aparece no outro', () async {
-    final server = FakeServer();
-    final eu = await device(server);
+    final backend = FakeBackend();
+    final eu = await device(backend);
     final fut = eu.create(DateTime(2026, 11, 12));
     fut.importText('Arena\nLista:\n1- Ana\n2- Bia\n3- Cris');
     await eu.createGroup('Arena');
-    await eu.syncNow();
+    await settle([eu]);
     expect(eu.status, SyncStatus.synced);
 
-    final ele = await device(server);
+    final ele = await device(backend);
     await ele.joinGroup(eu.groupCode!);
-    await ele.syncNow();
+    await backend.deliver();
+    await settle([eu, ele]);
     expect(ele.futs.single.players.map((p) => p.name), ['Ana', 'Bia', 'Cris']);
 
-    // Ele marca a Ana; eu marco a Bia ao mesmo tempo, sem ter visto a dele.
+    // Ele marca a Ana; eu marco a Bia antes de receber a mudança dele.
     final delefut = ele.futs.single;
     delefut.setPresent(delefut.players[0], true);
     await ele.syncNow();
     fut.setPresent(fut.players[1], true);
     await eu.syncNow();
 
-    // Nada se perde: os dois veem Ana e Bia.
-    await ele.syncNow();
+    // Nada se perde: depois que tudo chega, os dois veem Ana e Bia.
+    await backend.deliver();
+    await settle([eu, ele]);
+    await backend.deliver();
+    await settle([eu, ele]);
     for (final d in [eu, ele]) {
       final presentes = d.futs.single.presentPlayers
           .map((p) => p.name)
@@ -149,10 +178,20 @@ void main() {
     // Apagar em um tira do outro.
     eu.delete(fut);
     await eu.syncNow();
-    await ele.syncNow();
+    await backend.deliver();
+    await settle([ele]);
     expect(ele.futs, isEmpty);
 
     eu.dispose();
     ele.dispose();
+  });
+
+  test('link de grupo que não existe avisa', () async {
+    final eu = await device(FakeBackend());
+    expect(
+      () => eu.groupNameFor('nao-existe'),
+      throwsA(isA<GroupNotFoundException>()),
+    );
+    eu.dispose();
   });
 }

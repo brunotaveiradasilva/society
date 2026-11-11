@@ -13,8 +13,9 @@ No iPhone, abra o link no Safari e toque em **Compartilhar → Adicionar à Tela
 - Sorteio com quantidade de times, jogadores por time, goleiro fixo e cor de cada time.
 - Os times sorteados ficam travados; quem chegar depois entra no sorteio do próximo time.
 - Chamada com "foi" e "pagou", valor por pessoa e lista de quem falta pagar.
+- Grupo por link: quem abre o link vê e edita os mesmos futs, e as mudanças aparecem na hora.
 
-Os dados ficam salvos no próprio aparelho.
+Sem grupo, os dados ficam só no aparelho. Com grupo, ficam também no Firestore (projeto Firebase `society-fut`); as regras em `firestore.rules` só deixam abrir um grupo quem tem o código do link. Se duas pessoas mexem no mesmo fut ao mesmo tempo, o app junta as duas mudanças.
 
 ## Rodando
 
@@ -22,6 +23,12 @@ Os dados ficam salvos no próprio aparelho.
 flutter pub get
 flutter run -d chrome
 flutter test
+```
+
+Atualizar as regras do Firestore:
+
+```bash
+npx firebase-tools deploy --only firestore:rules
 ```
 
 Publicar no GitHub Pages:

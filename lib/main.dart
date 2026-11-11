@@ -1,7 +1,11 @@
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'backend.dart';
+import 'firebase_options.dart';
 import 'screens/checkin_screen.dart';
 import 'screens/draw_screen.dart';
 import 'screens/futs_screen.dart';
@@ -12,7 +16,20 @@ import 'theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final prefs = await SharedPreferences.getInstance();
-  runApp(SocietyApp(store: FutStore(prefs)));
+  runApp(SocietyApp(store: FutStore(prefs, backend: await _backend())));
+}
+
+/// Grupos usam o Firestore. Por enquanto só na web (o app do iPhone); no
+/// Android os futs ficam só no aparelho.
+Future<Backend?> _backend() async {
+  if (!kIsWeb || !firebaseConfigured) return null;
+  try {
+    await Firebase.initializeApp(options: firebaseWebOptions);
+    return FirestoreBackend();
+  } catch (e) {
+    debugPrint('Firebase indisponível: $e');
+    return null;
+  }
 }
 
 class SocietyApp extends StatelessWidget {

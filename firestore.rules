@@ -1,0 +1,37 @@
+rules_version = '2';
+
+// Grupos por link: o código do grupo (24 caracteres aleatórios) vai no link
+// do app. Quem tem o código lê e edita os futs daquele grupo. Ninguém lista
+// os grupos, então sem o link não dá para achar nenhum.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function grupoExiste(codigo) {
+      return exists(/databases/$(database)/documents/grupos/$(codigo));
+    }
+
+    match /grupos/{codigo} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if codigo.size() >= 20
+        && request.resource.data.keys().hasOnly(['nome', 'criadoEm'])
+        && request.resource.data.nome is string
+        && request.resource.data.nome.size() > 0
+        && request.resource.data.nome.size() <= 80;
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nome'])
+        && request.resource.data.nome is string
+        && request.resource.data.nome.size() <= 80;
+      allow delete: if false;
+
+      match /futs/{futId} {
+        allow read: if grupoExiste(codigo);
+        allow create, update: if grupoExiste(codigo)
+          && futId.size() <= 64
+          && request.resource.data.keys().hasOnly(['versao', 'dados', 'atualizadoEm'])
+          && request.resource.data.versao is int
+          && request.resource.data.dados is map;
+        allow delete: if grupoExiste(codigo);
+      }
+    }
+  }
+}

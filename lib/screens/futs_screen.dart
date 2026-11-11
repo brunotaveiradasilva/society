@@ -32,7 +32,7 @@ class _FutsScreenState extends State<FutsScreen> {
       onHide: store.pause,
     );
     final code = widget.joinCode;
-    if (code != null) {
+    if (code != null && store.canShare) {
       removeQueryFromUrl();
       if (code != store.groupCode) {
         WidgetsBinding.instance.addPostFrameCallback(
@@ -71,7 +71,7 @@ class _FutsScreenState extends State<FutsScreen> {
                   ),
               ],
             ),
-            actions: [GroupButton(store: store)],
+            actions: [if (store.canShare) GroupButton(store: store)],
           ),
           floatingActionButton: futs.isEmpty
               ? null

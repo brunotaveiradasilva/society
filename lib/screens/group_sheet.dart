@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../api.dart';
+import '../backend.dart';
 import '../state.dart';
 import '../theme.dart';
 
@@ -79,7 +79,8 @@ class _CreateGroupSheetState extends State<_CreateGroupSheet> {
     } catch (e) {
       setState(() {
         _loading = false;
-        _error = e is ApiException ? e.message : 'Não deu para falar com o servidor. Confira a internet e tente de novo.';
+        _error =
+            'Não deu para criar o grupo. Confira a internet e tente de novo.';
       });
     }
   }
@@ -269,7 +270,7 @@ Future<void> confirmJoin(
       builder: (context) => AlertDialog(
         title: const Text('Não deu para abrir o grupo'),
         content: Text(
-          e is ApiException && e.status == 404
+          e is GroupNotFoundException
               ? 'Este link de grupo não existe mais. Peça o link de novo.'
               : 'Sem conexão com o servidor agora. Abra o link de novo quando a internet voltar.',
         ),
