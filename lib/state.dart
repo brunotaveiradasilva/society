@@ -12,6 +12,9 @@ import 'parser.dart';
 
 const maxTeams = 6;
 
+/// Espaço no Firestore onde ficam os futs de todo mundo que usa o app.
+const sharedGroupCode = 'ahl8-1sR0XR5Ie8yKEegOuar';
+
 int _idSeq = 0;
 String newId() => '${DateTime.now().microsecondsSinceEpoch}_${_idSeq++}';
 
@@ -539,32 +542,18 @@ class FutStore extends ChangeNotifier {
     _seen.addAll(
       _sync.entries.where((e) => e.value.versao > 0).map((e) => e.key),
     );
-    if (inGroup) _connect();
+    // Todo mundo usa o mesmo espaço: quem abre o app vê e edita os mesmos
+    // futs. Na primeira vez, os futs que estavam só no aparelho vão junto.
+    if (canShare) {
+      if (groupCode == sharedGroupCode) {
+        _connect();
+      } else {
+        _enterGroup(sharedGroupCode, 'Society');
+      }
+    }
   }
 
-  // ---------- Grupo ----------
-
-  /// Link para mandar no grupo do WhatsApp.
-  String get shareLink {
-    final base = Uri.base;
-    final path = base.path.endsWith('/') ? base.path : '${base.path}/';
-    return '${base.origin}$path?grupo=$groupCode';
-  }
-
-  /// Cria um grupo e manda para ele os futs deste aparelho.
-  Future<void> createGroup(String nome) async {
-    final g = await _backend!.criarGrupo(nome);
-    _enterGroup(g.codigo, g.nome);
-  }
-
-  /// Entra no grupo do link. Os futs deste aparelho vão junto.
-  Future<void> joinGroup(String codigo) async {
-    final nome = await _backend!.nomeDoGrupo(codigo);
-    _enterGroup(codigo, nome);
-  }
-
-  /// Confere o código do link sem entrar: devolve o nome do grupo.
-  Future<String> groupNameFor(String codigo) => _backend!.nomeDoGrupo(codigo);
+  // ---------- Espaço compartilhado ----------
 
   void _enterGroup(String codigo, String nome) {
     groupCode = codigo;
@@ -577,25 +566,6 @@ class FutStore extends ChangeNotifier {
     }
     _changed();
     _connect();
-  }
-
-  /// Para de sincronizar. Os futs continuam neste aparelho, a não ser que
-  /// [keepFuts] seja falso (trocando de um grupo para outro).
-  void leaveGroup({bool keepFuts = true}) {
-    _disconnect();
-    groupCode = null;
-    groupName = null;
-    _sync.clear();
-    _pendingDeletes.clear();
-    _seen.clear();
-    if (!keepFuts) {
-      for (final f in _futs) {
-        f.onSave = null;
-      }
-      _futs.clear();
-    }
-    status = SyncStatus.local;
-    _changed();
   }
 
   // ---------- Sincronia ----------

@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 
@@ -11,9 +9,6 @@ class ServerFut {
   final int versao;
   final Map<String, dynamic> dados;
 }
-
-/// O código do link não corresponde a nenhum grupo.
-class GroupNotFoundException implements Exception {}
 
 /// Alguém gravou o fut antes: [atual] é o que está no grupo agora.
 class ConflictException implements Exception {
@@ -26,11 +21,6 @@ class GoneException implements Exception {}
 
 /// Onde os futs do grupo ficam guardados.
 abstract class Backend {
-  Future<({String codigo, String nome})> criarGrupo(String nome);
-
-  /// Nome do grupo do código; [GroupNotFoundException] se não existir.
-  Future<String> nomeDoGrupo(String codigo);
-
   /// Todos os futs do grupo, de novo a cada mudança.
   Stream<List<ServerFut>> futs(String codigo);
 
@@ -45,15 +35,7 @@ abstract class Backend {
   Future<void> apagar(String codigo, String id);
 }
 
-/// 18 bytes aleatórios em base64 de URL: 24 caracteres, seguros para o link.
-String newGroupCode([Random? random]) {
-  final r = random ?? Random.secure();
-  final bytes = List<int>.generate(18, (_) => r.nextInt(256));
-  return base64Url.encode(bytes).replaceAll('=', '');
-}
-
-/// Grupos no Firestore: `grupos/{codigo}` e `grupos/{codigo}/futs/{id}`.
-/// As regras do Firestore só deixam abrir um grupo por quem sabe o código.
+/// Futs no Firestore, em `grupos/{codigo}/futs/{id}`.
 class FirestoreBackend implements Backend {
   FirestoreBackend([FirebaseFirestore? db])
     : _db = db ?? FirebaseFirestore.instance;
@@ -61,23 +43,6 @@ class FirestoreBackend implements Backend {
 
   DocumentReference<Map<String, dynamic>> _grupo(String codigo) =>
       _db.collection('grupos').doc(codigo);
-
-  @override
-  Future<({String codigo, String nome})> criarGrupo(String nome) async {
-    final codigo = newGroupCode();
-    await _grupo(codigo)
-        .set({'nome': nome, 'criadoEm': FieldValue.serverTimestamp()});
-    return (codigo: codigo, nome: nome);
-  }
-
-  @override
-  Future<String> nomeDoGrupo(String codigo) async {
-    final snap = await _grupo(codigo)
-        .get(const GetOptions(source: Source.server));
-    final data = snap.data();
-    if (!snap.exists || data == null) throw GroupNotFoundException();
-    return data['nome'] as String? ?? 'Grupo';
-  }
 
   @override
   Stream<List<ServerFut>> futs(String codigo) {

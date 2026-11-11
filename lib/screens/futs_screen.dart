@@ -1,18 +1,14 @@
 import 'package:flutter/material.dart';
 
 import '../main.dart';
-import '../platform/url.dart';
 import '../state.dart';
 import '../theme.dart';
-import 'group_sheet.dart';
+import 'sync_status.dart';
 
 /// Tela inicial: um card por fut, do mais recente para o mais antigo.
-///
-/// [joinCode] é o código do grupo quando o app foi aberto por um link.
 class FutsScreen extends StatefulWidget {
-  const FutsScreen({super.key, required this.store, this.joinCode});
+  const FutsScreen({super.key, required this.store});
   final FutStore store;
-  final String? joinCode;
 
   @override
   State<FutsScreen> createState() => _FutsScreenState();
@@ -31,15 +27,6 @@ class _FutsScreenState extends State<FutsScreen> {
       onShow: store.resume,
       onHide: store.pause,
     );
-    final code = widget.joinCode;
-    if (code != null && store.canShare) {
-      removeQueryFromUrl();
-      if (code != store.groupCode) {
-        WidgetsBinding.instance.addPostFrameCallback(
-          (_) => confirmJoin(context, store, code),
-        );
-      }
-    }
   }
 
   @override
@@ -71,7 +58,7 @@ class _FutsScreenState extends State<FutsScreen> {
                   ),
               ],
             ),
-            actions: [if (store.canShare) GroupButton(store: store)],
+            actions: [SyncIcon(store: store)],
           ),
           floatingActionButton: futs.isEmpty
               ? null

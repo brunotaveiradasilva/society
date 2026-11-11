@@ -46,10 +46,7 @@ class SocietyApp extends StatelessWidget {
       locale: const Locale('pt', 'BR'),
       supportedLocales: const [Locale('pt', 'BR')],
       localizationsDelegates: GlobalMaterialLocalizations.delegates,
-      home: FutsScreen(
-        store: store,
-        joinCode: Uri.base.queryParameters['grupo'],
-      ),
+      home: FutsScreen(store: store),
     );
   }
 }

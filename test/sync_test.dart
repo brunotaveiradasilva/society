@@ -7,15 +7,17 @@ import 'package:society/backend.dart';
 import 'package:society/merge.dart';
 import 'package:society/state.dart';
 
-/// Grupo falso em memória, com as mesmas regras do Firestore do app. As
-/// mudanças só chegam aos aparelhos quando o teste chama [deliver], para dar
-/// para simular duas pessoas mexendo antes de ver a mudança da outra.
+/// Firestore falso em memória, com as mesmas regras do app. As mudanças só
+/// chegam aos aparelhos quando o teste chama [deliver], para dar para simular
+/// duas pessoas mexendo antes de ver a mudança da outra.
 class FakeBackend implements Backend {
-  final grupos = <String, String>{};
   final futsDb =
       <String, Map<String, ({int versao, Map<String, dynamic> dados})>>{};
   final _listeners = <String, List<StreamController<List<ServerFut>>>>{};
-  var _seq = 0;
+
+  Map<String, ({int versao, Map<String, dynamic> dados})> _doGrupo(
+    String codigo,
+  ) => futsDb[codigo] ??= {};
 
   /// Cópia "de ida e volta", como o Firestore: reordena as chaves.
   Map<String, dynamic> _roundTrip(Map<String, dynamic> d) {
@@ -24,11 +26,11 @@ class FakeBackend implements Backend {
   }
 
   List<ServerFut> _list(String codigo) => [
-    for (final e in futsDb[codigo]!.entries)
+    for (final e in _doGrupo(codigo).entries)
       ServerFut(e.key, e.value.versao, _roundTrip(e.value.dados)),
   ];
 
-  /// Entrega o estado atual do grupo para quem está ouvindo.
+  /// Entrega o estado atual para quem está ouvindo.
   Future<void> deliver() async {
     for (final e in _listeners.entries) {
       for (final c in e.value) {
@@ -37,18 +39,6 @@ class FakeBackend implements Backend {
     }
     await pumpEventQueue();
   }
-
-  @override
-  Future<({String codigo, String nome})> criarGrupo(String nome) async {
-    final codigo = 'codigo${_seq++}';
-    grupos[codigo] = nome;
-    futsDb[codigo] = {};
-    return (codigo: codigo, nome: nome);
-  }
-
-  @override
-  Future<String> nomeDoGrupo(String codigo) async =>
-      grupos[codigo] ?? (throw GroupNotFoundException());
 
   @override
   Stream<List<ServerFut>> futs(String codigo) {
@@ -68,7 +58,7 @@ class FakeBackend implements Backend {
     int versao,
     Map<String, dynamic> dados,
   ) async {
-    final doGrupo = futsDb[codigo]!;
+    final doGrupo = _doGrupo(codigo);
     final atual = doGrupo[id];
     if (atual == null) {
       if (versao != 0) throw GoneException();
@@ -86,12 +76,16 @@ class FakeBackend implements Backend {
 
   @override
   Future<void> apagar(String codigo, String id) async =>
-      futsDb[codigo]!.remove(id);
+      _doGrupo(codigo).remove(id);
 }
 
-Future<FutStore> device(FakeBackend backend) async {
+/// Um aparelho novo (armazenamento vazio, ou com [saved]).
+Future<FutStore> device(
+  FakeBackend backend, [
+  Map<String, Object> saved = const {},
+]) async {
   SharedPreferences.resetStatic();
-  SharedPreferences.setMockInitialValues({});
+  SharedPreferences.setMockInitialValues(saved);
   final prefs = await SharedPreferences.getInstance();
   return FutStore(prefs, backend: backend);
 }
@@ -135,25 +129,18 @@ void main() {
     expect(players, {'a': true, 'b': true, 'c': false});
   });
 
-  test('o código do grupo é longo e serve para link', () {
-    final codigo = newGroupCode();
-    expect(codigo, hasLength(24));
-    expect(RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(codigo), isTrue);
-  });
-
-  test('o que um aparelho muda aparece no outro', () async {
+  test('todo mundo vê e edita os mesmos futs', () async {
     final backend = FakeBackend();
     final eu = await device(backend);
+    expect(eu.groupCode, sharedGroupCode);
     final fut = eu.create(DateTime(2026, 11, 12));
     fut.importText('Arena\nLista:\n1- Ana\n2- Bia\n3- Cris');
-    await eu.createGroup('Arena');
     await settle([eu]);
     expect(eu.status, SyncStatus.synced);
 
+    // Outra pessoa abre o app pela primeira vez: já vê o fut.
     final ele = await device(backend);
-    await ele.joinGroup(eu.groupCode!);
-    await backend.deliver();
-    await settle([eu, ele]);
+    await settle([ele]);
     expect(ele.futs.single.players.map((p) => p.name), ['Ana', 'Bia', 'Cris']);
 
     // Ele marca a Ana; eu marco a Bia antes de receber a mudança dele.
@@ -186,12 +173,27 @@ void main() {
     ele.dispose();
   });
 
-  test('link de grupo que não existe avisa', () async {
-    final eu = await device(FakeBackend());
-    expect(
-      () => eu.groupNameFor('nao-existe'),
-      throwsA(isA<GroupNotFoundException>()),
-    );
+  test('futs que estavam só no aparelho sobem na primeira vez', () async {
+    final backend = FakeBackend();
+    final antigo = {
+      'id': 'local-1',
+      'date': '2026-11-05T00:00:00.000',
+      'title': 'Fut antigo',
+      'players': [
+        {'id': 'x', 'name': 'Xande', 'role': 'line'},
+      ],
+    };
+    final eu = await device(backend, {
+      'flutter.society_futs_v1': jsonEncode([antigo]),
+    });
+    await settle([eu]);
+    expect(backend.futsDb[sharedGroupCode]!.keys, ['local-1']);
+
+    final ele = await device(backend);
+    await settle([ele]);
+    expect(ele.futs.single.title, 'Fut antigo');
+
     eu.dispose();
+    ele.dispose();
   });
 }
