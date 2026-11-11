@@ -1,13 +1,52 @@
 import 'package:flutter/material.dart';
 
 import '../main.dart';
+import '../platform/url.dart';
 import '../state.dart';
 import '../theme.dart';
+import 'group_sheet.dart';
 
 /// Tela inicial: um card por fut, do mais recente para o mais antigo.
-class FutsScreen extends StatelessWidget {
-  const FutsScreen({super.key, required this.store});
+///
+/// [joinCode] é o código do grupo quando o app foi aberto por um link.
+class FutsScreen extends StatefulWidget {
+  const FutsScreen({super.key, required this.store, this.joinCode});
   final FutStore store;
+  final String? joinCode;
+
+  @override
+  State<FutsScreen> createState() => _FutsScreenState();
+}
+
+class _FutsScreenState extends State<FutsScreen> {
+  late final AppLifecycleListener _lifecycle;
+
+  FutStore get store => widget.store;
+
+  @override
+  void initState() {
+    super.initState();
+    // Só busca mudanças com o app na tela.
+    _lifecycle = AppLifecycleListener(
+      onShow: store.resume,
+      onHide: store.pause,
+    );
+    final code = widget.joinCode;
+    if (code != null) {
+      removeQueryFromUrl();
+      if (code != store.groupCode) {
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => confirmJoin(context, store, code),
+        );
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _lifecycle.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -16,8 +55,24 @@ class FutsScreen extends StatelessWidget {
       builder: (context, _) {
         final futs = store.futs;
         final theme = Theme.of(context);
+        final sub = syncLabel(store);
         return Scaffold(
-          appBar: AppBar(title: const Text('Society')),
+          appBar: AppBar(
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Society'),
+                if (sub != null)
+                  Text(
+                    sub,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+              ],
+            ),
+            actions: [GroupButton(store: store)],
+          ),
           floatingActionButton: futs.isEmpty
               ? null
               : FloatingActionButton.extended(

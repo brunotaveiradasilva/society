@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'api.dart';
 import 'draw.dart';
+import 'merge.dart';
 import 'models.dart';
 import 'parser.dart';
 
@@ -310,27 +313,45 @@ class Fut extends ChangeNotifier {
       id: d['id'] as String? ?? newId(),
       date: DateTime.tryParse(d['date'] as String? ?? '') ?? DateTime.now(),
     );
-    f.title = d['title'] as String? ?? 'Fut';
-    f.info = d['info'] as String?;
-    f.players.addAll(
-      (d['players'] as List? ?? const []).map(
-        (e) => Player.fromJson(e as Map<String, dynamic>),
-      ),
-    );
-    f.teamCount = d['teamCount'] as int? ?? 2;
-    f.perTeam = d['perTeam'] as int? ?? 5;
-    f.fixedGoalkeepers = d['fixedGoalkeepers'] as bool? ?? true;
-    final colors = (d['colorIndexes'] as List?)?.cast<int>();
-    if (colors != null && colors.length == maxTeams) f.colorIndexes = colors;
-    f.pricePerPerson = (d['price'] as num?)?.toDouble();
+    f._fill(d);
+    return f;
+  }
 
-    final draw = d['draw'] as Map<String, dynamic>?;
+  /// Troca o conteúdo pelo que veio de outro aparelho, sem disparar o salvar.
+  void applyJson(Map<String, dynamic> d) {
+    _fill(d);
+    notifyListeners();
+  }
+
+  void _fill(Map<String, dynamic> d) {
+    final parsedDate = DateTime.tryParse(d['date'] as String? ?? '');
+    if (parsedDate != null) date = dateOnly(parsedDate);
+    title = d['title'] as String? ?? 'Fut';
+    info = d['info'] as String?;
+    players
+      ..clear()
+      ..addAll(
+        (d['players'] as List? ?? const []).map(
+          (e) => Player.fromJson((e as Map).cast<String, dynamic>()),
+        ),
+      );
+    teamCount = d['teamCount'] as int? ?? 2;
+    perTeam = d['perTeam'] as int? ?? 5;
+    fixedGoalkeepers = d['fixedGoalkeepers'] as bool? ?? true;
+    final colors = (d['colorIndexes'] as List?)?.cast<int>();
+    colorIndexes = colors != null && colors.length == maxTeams
+        ? [...colors]
+        : List.generate(maxTeams, (i) => i);
+    pricePerPerson = (d['price'] as num?)?.toDouble();
+
+    teams.clear();
+    final draw = d['draw'] as Map?;
     if (draw != null) {
-      final byId = {for (final p in f.players) p.id: p};
+      final byId = {for (final p in players) p.id: p};
       List<Player> resolve(List ids) =>
           ids.map((id) => byId[id]).whereType<Player>().toList();
-      f.teams.addAll([
-        for (final t in (draw['teams'] as List).cast<Map<String, dynamic>>())
+      teams.addAll([
+        for (final t in (draw['teams'] as List).cast<Map>())
           DrawnTeam(
             colorIndex: t['color'] as int,
             goalkeeper: byId[t['gk']],
@@ -338,25 +359,73 @@ class Fut extends ChangeNotifier {
           ),
       ]);
     }
-    return f;
   }
 }
 
-/// Todos os futs salvos no aparelho.
+/// Estado da conexão com o grupo, para mostrar na tela.
+enum SyncStatus { local, synced, syncing, offline }
+
+/// Dados de sincronia de um fut: a versão do servidor que este aparelho
+/// conhece e como o fut estava nela (base para juntar mudanças).
+class _SyncInfo {
+  _SyncInfo({this.versao = 0, this.base, this.dirty = false});
+  int versao;
+  Map<String, dynamic>? base;
+  bool dirty;
+
+  Map<String, dynamic> toJson() => {
+    'versao': versao,
+    'base': ?base,
+    'dirty': dirty,
+  };
+
+  factory _SyncInfo.fromJson(Map<String, dynamic> j) => _SyncInfo(
+    versao: j['versao'] as int? ?? 0,
+    base: (j['base'] as Map?)?.cast<String, dynamic>(),
+    dirty: j['dirty'] as bool? ?? false,
+  );
+}
+
+/// Todos os futs. Sem grupo, ficam só no aparelho. Com grupo, cada mudança
+/// vai para a API e as mudanças dos outros chegam a cada poucos segundos.
 class FutStore extends ChangeNotifier {
-  FutStore(this._prefs) {
+  FutStore(this._prefs, {Api? api}) : _api = api ?? Api() {
     _load();
   }
 
   static const _key = 'society_futs_v1';
   static const _legacyKey = 'society_v1';
+  static const _syncKey = 'society_sync_v1';
+  static const pollEvery = Duration(seconds: 5);
+
   final SharedPreferences _prefs;
+  final Api _api;
   final List<Fut> _futs = [];
+
+  String? groupCode;
+  String? groupName;
+  final Map<String, _SyncInfo> _sync = {};
+  final Set<String> _pendingDeletes = {};
+  SyncStatus status = SyncStatus.local;
+
+  Timer? _timer;
+  Timer? _pushDebounce;
+  Future<void>? _running;
+  bool _again = false;
+
+  bool get inGroup => groupCode != null;
 
   /// Mais recente primeiro.
   List<Fut> get futs => [..._futs]..sort((a, b) => b.date.compareTo(a.date));
 
   Fut? get latest => _futs.isEmpty ? null : futs.first;
+
+  Fut? byId(String id) {
+    for (final f in _futs) {
+      if (f.id == id) return f;
+    }
+    return null;
+  }
 
   /// Sugestão de data: uma semana depois do último fut, ou hoje.
   DateTime suggestedDate() {
@@ -371,27 +440,52 @@ class FutStore extends ChangeNotifier {
     final f = copyFrom?.copyFor(date) ?? Fut(id: newId(), date: date);
     _attach(f);
     _futs.add(f);
-    _changed();
+    _changedFut(f);
     return f;
   }
 
   void delete(Fut f) {
     _futs.remove(f);
     f.onSave = null;
+    final info = _sync.remove(f.id);
+    if (inGroup && info != null && info.versao > 0) _pendingDeletes.add(f.id);
     _changed();
+    if (inGroup) _schedulePush();
   }
 
   void restore(Fut f) {
+    _pendingDeletes.remove(f.id);
     _attach(f);
     _futs.add(f);
+    _changedFut(f);
+  }
+
+  void _attach(Fut f) => f.onSave = () => _changedFut(f);
+
+  void _changedFut(Fut f) {
+    if (inGroup) {
+      (_sync[f.id] ??= _SyncInfo()).dirty = true;
+      _schedulePush();
+    }
     _changed();
   }
 
-  void _attach(Fut f) => f.onSave = _changed;
-
   void _changed() {
     notifyListeners();
+    _saveLocal();
+  }
+
+  void _saveLocal() {
     _prefs.setString(_key, jsonEncode(_futs.map((f) => f.toJson()).toList()));
+    _prefs.setString(
+      _syncKey,
+      jsonEncode({
+        'grupo': ?groupCode,
+        'nome': ?groupName,
+        'futs': {for (final e in _sync.entries) e.key: e.value.toJson()},
+        'apagar': _pendingDeletes.toList(),
+      }),
+    );
   }
 
   void _load() {
@@ -399,23 +493,258 @@ class FutStore extends ChangeNotifier {
       final raw = _prefs.getString(_key);
       if (raw != null) {
         for (final e in (jsonDecode(raw) as List)) {
-          final f = Fut.fromJson(e as Map<String, dynamic>);
+          final f = Fut.fromJson((e as Map).cast<String, dynamic>());
           _attach(f);
           _futs.add(f);
         }
-        return;
+      } else {
+        // A versão anterior guardava um fut só: ele vira o primeiro da lista.
+        final legacy = _prefs.getString(_legacyKey);
+        if (legacy != null) {
+          final f = Fut.fromJson(jsonDecode(legacy) as Map<String, dynamic>);
+          _attach(f);
+          _futs.add(f);
+          _saveLocal();
+          _prefs.remove(_legacyKey);
+        }
       }
-      // A versão anterior guardava um fut só: ele vira o primeiro da lista.
-      final legacy = _prefs.getString(_legacyKey);
-      if (legacy != null) {
-        final f = Fut.fromJson(jsonDecode(legacy) as Map<String, dynamic>);
-        _attach(f);
-        _futs.add(f);
-        _changed();
-        _prefs.remove(_legacyKey);
+
+      final sync = _prefs.getString(_syncKey);
+      if (sync != null) {
+        final s = jsonDecode(sync) as Map<String, dynamic>;
+        groupCode = s['grupo'] as String?;
+        groupName = s['nome'] as String?;
+        for (final e in (s['futs'] as Map? ?? const {}).entries) {
+          _sync[e.key as String] = _SyncInfo.fromJson(
+            (e.value as Map).cast<String, dynamic>(),
+          );
+        }
+        _pendingDeletes.addAll(
+          (s['apagar'] as List? ?? const []).cast<String>(),
+        );
       }
     } catch (e) {
       debugPrint('Falha ao ler dados salvos: $e');
     }
+    if (inGroup) _startPolling();
+  }
+
+  // ---------- Grupo ----------
+
+  /// Link para mandar no grupo do WhatsApp.
+  String get shareLink {
+    final base = Uri.base;
+    final path = base.path.endsWith('/') ? base.path : '${base.path}/';
+    return '${base.origin}$path?grupo=$groupCode';
+  }
+
+  /// Cria um grupo e manda para ele os futs deste aparelho.
+  Future<void> createGroup(String nome) async {
+    final g = await _api.criarGrupo(nome);
+    _enterGroup(g.codigo, g.nome);
+  }
+
+  /// Entra no grupo do link. Os futs deste aparelho vão junto.
+  Future<void> joinGroup(String codigo) async {
+    final nome = await _api.nomeDoGrupo(codigo);
+    _enterGroup(codigo, nome);
+  }
+
+  /// Confere o código do link sem entrar: devolve o nome do grupo.
+  Future<String> groupNameFor(String codigo) => _api.nomeDoGrupo(codigo);
+
+  void _enterGroup(String codigo, String nome) {
+    groupCode = codigo;
+    groupName = nome;
+    _sync.clear();
+    _pendingDeletes.clear();
+    for (final f in _futs) {
+      _sync[f.id] = _SyncInfo(dirty: true);
+    }
+    _api.forget();
+    _changed();
+    _startPolling();
+  }
+
+  /// Para de sincronizar. Os futs continuam neste aparelho, a não ser que
+  /// [keepFuts] seja falso (trocando de um grupo para outro).
+  void leaveGroup({bool keepFuts = true}) {
+    _timer?.cancel();
+    _pushDebounce?.cancel();
+    groupCode = null;
+    groupName = null;
+    _sync.clear();
+    _pendingDeletes.clear();
+    if (!keepFuts) {
+      for (final f in _futs) {
+        f.onSave = null;
+      }
+      _futs.clear();
+    }
+    status = SyncStatus.local;
+    _api.forget();
+    _changed();
+  }
+
+  // ---------- Sincronia ----------
+
+  void _startPolling() {
+    _timer?.cancel();
+    _timer = Timer.periodic(pollEvery, (_) => syncNow());
+    syncNow();
+  }
+
+  /// Pausa a busca enquanto o app está em segundo plano.
+  void pause() => _timer?.cancel();
+
+  void resume() {
+    if (inGroup) _startPolling();
+  }
+
+  void _schedulePush() {
+    _pushDebounce?.cancel();
+    _pushDebounce = Timer(const Duration(milliseconds: 500), syncNow);
+  }
+
+  void _setStatus(SyncStatus s) {
+    if (status == s) return;
+    status = s;
+    notifyListeners();
+  }
+
+  /// Manda o que mudou aqui e traz o que mudou nos outros aparelhos.
+  ///
+  /// Se já tem uma rodada em andamento, marca para repetir e espera as duas.
+  Future<void> syncNow() {
+    if (groupCode == null) return Future.value();
+    final running = _running;
+    if (running != null) {
+      _again = true;
+      return running;
+    }
+    return _running = _syncLoop().whenComplete(() => _running = null);
+  }
+
+  Future<void> _syncLoop() async {
+    do {
+      _again = false;
+      await _syncOnce();
+    } while (_again && groupCode != null);
+  }
+
+  Future<void> _syncOnce() async {
+    final code = groupCode;
+    if (code == null) return;
+    try {
+      final hasLocal =
+          _pendingDeletes.isNotEmpty || _sync.values.any((s) => s.dirty);
+      if (hasLocal) _setStatus(SyncStatus.syncing);
+      await _pushDeletes(code);
+      await _pull(code);
+      await _pushDirty(code);
+      _setStatus(SyncStatus.synced);
+    } on ApiException catch (e) {
+      debugPrint('API: $e');
+      _setStatus(SyncStatus.offline);
+    } catch (e) {
+      debugPrint('Sem conexão com a API: $e');
+      _setStatus(SyncStatus.offline);
+    } finally {
+      _saveLocal();
+    }
+  }
+
+  Future<void> _pushDeletes(String code) async {
+    for (final id in [..._pendingDeletes]) {
+      await _api.apagar(code, id);
+      _pendingDeletes.remove(id);
+    }
+  }
+
+  Future<void> _pull(String code) async {
+    final list = await _api.listar(code);
+    if (list == null) return;
+    var changed = false;
+    final onServer = <String>{};
+
+    for (final s in list) {
+      onServer.add(s.id);
+      if (_pendingDeletes.contains(s.id)) continue;
+      final local = byId(s.id);
+      final info = _sync[s.id];
+      if (local == null) {
+        final f = Fut.fromJson({...s.dados, 'id': s.id});
+        _attach(f);
+        _futs.add(f);
+        _sync[s.id] = _SyncInfo(versao: s.versao, base: s.dados);
+        changed = true;
+      } else if (info == null || info.versao != s.versao) {
+        _receive(local, info ?? (_sync[s.id] = _SyncInfo()), s);
+        changed = true;
+      }
+    }
+
+    // Apagados em outro aparelho: estavam no servidor e sumiram.
+    for (final f in [..._futs]) {
+      final info = _sync[f.id];
+      if (info != null && info.versao > 0 && !onServer.contains(f.id)) {
+        _futs.remove(f);
+        f.onSave = null;
+        _sync.remove(f.id);
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
+  }
+
+  /// Chegou uma versão nova do servidor. Sem mudança pendente aqui, ela
+  /// substitui a local; com mudança pendente, as duas são juntadas.
+  void _receive(Fut local, _SyncInfo info, ServerFut s) {
+    if (info.dirty) {
+      final merged = merge3(info.base, local.toJson(), s.dados);
+      local.applyJson((merged as Map).cast<String, dynamic>());
+    } else {
+      local.applyJson(s.dados);
+    }
+    info
+      ..versao = s.versao
+      ..base = s.dados;
+  }
+
+  Future<void> _pushDirty(String code) async {
+    for (final f in [..._futs]) {
+      final info = _sync[f.id] ??= _SyncInfo(dirty: true);
+      if (!info.dirty) continue;
+      // Cada conflito junta as mudanças e tenta de novo.
+      for (var attempt = 0; attempt < 3; attempt++) {
+        final sent = f.toJson();
+        try {
+          final versao = await _api.gravar(code, f.id, info.versao, sent);
+          info
+            ..versao = versao
+            ..base = sent
+            // Mudou de novo enquanto gravava? Continua pendente.
+            ..dirty = jsonEncode(f.toJson()) != jsonEncode(sent);
+          break;
+        } on ConflictException catch (c) {
+          _receive(f, info, c.atual);
+          info.dirty = true;
+          notifyListeners();
+        } on GoneException {
+          _futs.remove(f);
+          f.onSave = null;
+          _sync.remove(f.id);
+          notifyListeners();
+          break;
+        }
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _pushDebounce?.cancel();
+    super.dispose();
   }
 }
